@@ -45,3 +45,12 @@ node_modules/
 
 # Node.js dependencies
 node_modules/
+
+# Local development / backup artifacts
+README.md.txt
+interactionEngine_current.txt
+*.pre_progress_fix
+*.pre_behavior_fix
+
+# Accidental nested clone
+/AVAF-Pro/
