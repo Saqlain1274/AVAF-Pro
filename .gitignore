@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Node
+node_modules/
+
+# Runtime/build/cache
+*.log
+*.tmp
+*.cache
+
+# AVAF generated scan output
+phase1_scanning_detection/output/*
+phase2_refinement_validation/output/*
+phase3_evaluation_exploitation_reporting/output/*
+
+# Keep output directories
+!phase1_scanning_detection/output/.gitkeep
+!phase2_refinement_validation/output/.gitkeep
+!phase3_evaluation_exploitation_reporting/output/.gitkeep
+
+# OS
+Thumbs.db
+.DS_Store

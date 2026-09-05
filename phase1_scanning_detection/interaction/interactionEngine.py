@@ -1,0 +1,2439 @@
+"""
+AVAF PRO
+Phase-1 Browser-Behavior Interaction Engine
+
+This module performs browser-driven behavioral discovery only.
+
+Rules:
+- Playwright's current rendered browser state is the source of truth.
+- No guessed URLs, routes, endpoints, parameters, or wordlists.
+- No vulnerability payloads or Phase-2 validation.
+- No arbitrary form submission.
+- Text/password/file inputs are observed only.
+- Selects are observed only; no arbitrary option is selected.
+- Only safe, visible, enabled, same-origin browser controls may be clicked.
+- Script/resource metadata is retained only when observed in the rendered DOM; no script-derived URL is crawled automatically.
+- Destructive/business-sensitive actions are observed but not activated.
+- The crawler owns page scheduling; this engine owns only in-page interaction.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import heapq
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import urlparse
+
+from phase1_scanning_detection.behavior.browser_observation_ledger import (
+    BrowserObservationLedger,
+)
+from phase1_scanning_detection.behavior.behavioral_surface_selector import (
+    SURFACE_SELECTOR,
+)
+
+try:
+    from phase1_scanning_detection.discovery.logger import logger
+except Exception:  # pragma: no cover
+    logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class InteractionSurface:
+    """One actionable or observable surface from a rendered browser state."""
+
+    priority: int
+    action: str
+    locator: str
+    source: str = "rendered-dom"
+    metadata: dict[str, Any] = field(default_factory=dict)
+    visited: bool = False
+
+
+def _empty_result() -> dict[str, Any]:
+    return {
+        "events": [],
+        "navigations": [],
+        "routes": [],
+        "external_navigations": [],
+        "controls": [],
+        "forms": [],
+        "surfaces": [],
+        "dom_states": [],
+        "runtime_observations": [],
+        "network_observations": [],
+        "scripts": [],
+        "observed_resources": [],
+        "application_vectors": [],
+        "stats": {},
+    }
+
+
+class InteractionEngine:
+    """
+    Browser-driven Phase-1 interaction engine.
+
+    The engine observes the current page, queues surfaces from that page,
+    performs one safe browser action at a time, observes the resulting state,
+    and continues while genuinely new observed surfaces/states exist.
+
+    It does not independently crawl pages and does not manufacture targets.
+    """
+
+    def __init__(self, queue=None) -> None:
+        self._crawler_queue = queue
+        self._interaction_origin = ""
+        self.runtime_callback = None
+        self.screenshot_callback = None
+
+        # A screenshot belongs to a browser-observed state, not merely to a URL.
+        # The same URL can legitimately produce multiple rendered states.
+        self._captured_state_screenshots: set[str] = set()
+        
+        # Timeouts are execution safeguards, not discovery/action limits.
+        
+        # Timeouts are execution safeguards, not discovery/action limits.
+        self.action_timeout = 2500
+        self.navigation_timeout = 1800
+        self.post_action_delay = 0.10
+
+        self._interaction_queue: list[
+            tuple[int, int, InteractionSurface]
+        ] = []
+        self._interaction_counter = 0
+
+        # (state, action, identity)
+        self._seen_surfaces: set[tuple[str, str, str]] = set()
+        self._executed: set[tuple[str, str, str]] = set()
+
+        self._visited_states: set[str] = set()
+        self._observed_urls: set[str] = set()
+        self._runtime_fingerprints: set[str] = set()
+        self._network_fingerprints: set[str] = set()
+
+        self._current_state = ""
+        self._graph: dict[str, dict[str, Any]] = {}
+        
+        # Component-level behavioral intelligence.
+        # These components consume browser-observed evidence only.
+        self.surface_selector = SURFACE_SELECTOR
+        self.observation_ledger = BrowserObservationLedger()
+        
+        # DecisionEngine is supplied by the crawler at exploration time.
+        self.decision_engine = None
+        
+        self._result = _empty_result()
+        self.stats = self._new_stats()
+
+    @staticmethod
+    def _new_stats() -> dict[str, Any]:
+        return {
+            "rounds": 0,
+            "actions": 0,
+            "surfaces": 0,
+            "clicks": 0,
+            "hovers": 0,
+            "forms": 0,
+            "controls_filled": 0,
+            "controls_observed": 0,
+            "dialogs": 0,
+            "navigation_changes": 0,
+            "runtime_feedback": 0,
+            "failed_actions": 0,
+            "skipped_actions": 0,
+            "dom_states": 0,
+            "new_dom_states": 0,
+            "new_routes": 0,
+            "new_controls": 0,
+            "new_forms": 0,
+            "runtime_events": 0,
+            "network_observations": 0,
+            "scripts_observed": 0,
+            "resources_observed": 0,
+            "application_vectors": 0,
+            "dom_snapshot_ms": 0.0,
+            "action_ms": 0.0,
+            "settle_ms": 0.0,
+            "runtime_ms": 0.0,
+            "state_ms": 0.0,
+            "total_ms": 0.0,
+        }
+
+    # ------------------------------------------------------------------
+    # Public compatibility API
+    # ------------------------------------------------------------------
+
+    def set_runtime_callback(self, callback) -> None:
+        self.runtime_callback = callback
+
+    def set_screenshot_callback(self, callback) -> None:
+        self.screenshot_callback = callback
+
+    def reset(self) -> None:
+        self._interaction_queue.clear()
+        self._interaction_counter = 0
+        self._seen_surfaces.clear()
+        self._executed.clear()
+        self._visited_states.clear()
+        self.observation_ledger.reset()
+        self._observed_urls.clear()
+        self._runtime_fingerprints.clear()
+        self._network_fingerprints.clear()
+        self._captured_state_screenshots.clear()
+        self._current_state = ""
+        self._graph.clear()
+        self._result = _empty_result()
+        self.stats = self._new_stats()
+        
+    async def _capture_new_state_screenshot(
+        self,
+        page,
+        snapshot: dict[str, Any],
+        state: str,
+        caused_by: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Capture exactly one screenshot for each genuinely new rendered
+        browser state.
+
+        Screenshot capture is evidence collection only.
+        It never creates crawl targets.
+        """
+
+        if page is None or not state:
+            return
+
+        if state in self._captured_state_screenshots:
+            return
+
+        if self.screenshot_callback is None:
+            return
+
+        try:
+            if page.is_closed():
+                return
+        except Exception:
+            return
+
+        payload = {
+            "state": state,
+            "url": self._safe_string(
+                snapshot.get("url")
+            ),
+            "title": self._safe_string(
+                snapshot.get("title")
+            ),
+            "caused_by": caused_by or {},
+            "state_number": len(self._visited_states),
+        }
+
+        try:
+            result = self.screenshot_callback(
+                page,
+                payload,
+            )
+
+            if hasattr(result, "__await__"):
+                await result
+
+            self._captured_state_screenshots.add(state)
+
+            self._log(
+                "info",
+                (
+                    "STATE SCREENSHOT captured | "
+                    f"state={len(self._visited_states):03d} | "
+                    f"url={payload['url']}"
+                ),
+            )
+
+        except Exception as exc:
+            # A screenshot failure must never invalidate browser discovery.
+            self._log(
+                "debug",
+                (
+                    "State screenshot failed | "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+
+    def get_result(self) -> dict[str, Any]:
+        self._result["stats"] = dict(self.stats)
+        return self._result
+
+    def export_graph(self) -> dict[str, Any]:
+        return {
+            "states": dict(self._graph),
+            "visited_states": list(self._visited_states),
+            "observed_urls": list(self._observed_urls),
+            "stats": dict(self.stats),
+        }
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hash(value: Any) -> str:
+        try:
+            raw = json.dumps(
+                value,
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            )
+        except Exception:
+            raw = repr(value)
+        return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+
+    @staticmethod
+    def _safe_string(value: Any) -> str:
+        if value is None:
+            return ""
+        try:
+            return str(value).strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _as_list(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, (tuple, set)):
+            return list(value)
+        return [value]
+
+    @staticmethod
+    def _page_url(page) -> str:
+        try:
+            return str(page.url or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _invalid_url(url: str) -> bool:
+        value = str(url or "").strip().lower()
+        return not value or value.startswith(
+            (
+                "about:",
+                "chrome:",
+                "edge:",
+                "file:",
+                "data:",
+                "blob:",
+                "javascript:",
+            )
+        )
+        
+    def _same_interaction_origin(
+        self,
+        url: str,
+    ) -> bool:
+        try:
+            parsed = urlparse(
+                str(url or "")
+            )
+
+            return (
+                parsed.scheme.lower(),
+                (parsed.hostname or "").lower(),
+                parsed.port,
+            ) == self._interaction_origin
+
+        except Exception:
+            return False
+
+    def _same_origin(self, page, candidate: str) -> bool:
+        current = urlparse(self._page_url(page))
+        target = urlparse(candidate)
+
+        if target.scheme.lower() not in ("http", "https"):
+            return False
+
+        if current.scheme.lower() not in ("http", "https"):
+            return False
+
+        if (target.hostname or "").lower() != (current.hostname or "").lower():
+            return False
+
+        return target.port == current.port
+
+    def _surface_key(
+        self,
+        surface: InteractionSurface,
+    ) -> tuple[str, str, str, str]:
+        """
+        Stable identity for one browser-observed interaction surface.
+
+        The browser state is deliberately NOT part of the permanent
+        surface identity.
+
+        Otherwise a harmless DOM/state change would make the same
+        physical application control appear to be a brand-new action,
+        causing repeated clicks and exploration loops.
+        """
+
+        metadata = (
+            surface.metadata
+            if isinstance(surface.metadata, dict)
+            else {}
+        )
+
+        identity = self._safe_string(
+            metadata.get("identity")
+            or metadata.get("identity_hash")
+            or surface.locator
+        )
+
+        action = self._safe_string(
+            surface.action
+        ).lower()
+
+        source = self._safe_string(
+            surface.source
+        )
+
+        locator = self._safe_string(
+            surface.locator
+        )
+
+        return (
+            action,
+            identity,
+            source,
+            locator,
+        )
+
+    # ------------------------------------------------------------------
+    # Queue
+    # ------------------------------------------------------------------
+
+    async def add_surface(self, surface: InteractionSurface) -> bool:
+        if surface is None:
+            return False
+
+        key = self._surface_key(surface)
+        if key in self._seen_surfaces:
+            return False
+
+        self._seen_surfaces.add(key)
+        self._interaction_counter += 1
+
+        heapq.heappush(
+            self._interaction_queue,
+            (
+                -int(surface.priority),
+                self._interaction_counter,
+                surface,
+            ),
+        )
+        self.stats["surfaces"] += 1
+        return True
+
+    async def next_surface(self) -> InteractionSurface | None:
+        while self._interaction_queue:
+            _, _, surface = heapq.heappop(self._interaction_queue)
+            if surface is not None and not surface.visited:
+                return surface
+        return None
+
+    def has_work(self) -> bool:
+        return bool(self._interaction_queue)
+
+    def mark_executed(self, surface: InteractionSurface | None) -> bool:
+        if surface is None:
+            return False
+
+        key = self._surface_key(surface)
+        surface.visited = True
+
+        if key in self._executed:
+            return False
+
+        self._executed.add(key)
+        self.stats["actions"] += 1
+        return True
+
+    # ------------------------------------------------------------------
+    # Live DOM observation
+    # ------------------------------------------------------------------
+
+    async def discover_live_dom_surfaces(self, page) -> dict[str, Any]:
+        """
+        Observe the current rendered DOM in exactly one browser evaluation.
+
+        The returned snapshot is data only. It never creates crawl targets.
+        """
+
+        if page is None:
+            return self._empty_snapshot()
+
+        try:
+            if page.is_closed():
+                return self._empty_snapshot()
+        except Exception:
+            return self._empty_snapshot()
+
+        started = time.perf_counter()
+        
+        script = r"""
+        () => {
+            const normalize = (value, limit = 240) =>
+                String(value || "")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .slice(0, limit);
+
+            const visible = (el) => {
+                if (!el) return false;
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return (
+                    style.display !== "none" &&
+                    style.visibility !== "hidden" &&
+                    style.opacity !== "0" &&
+                    rect.width > 0 &&
+                    rect.height > 0
+                );
+            };
+
+            const disabled = (el) =>
+                el.disabled === true ||
+                el.getAttribute("aria-disabled") === "true";
+            
+            const elementValue = (el) => {
+                if (!el) return "";
+            
+                const tag = (el.tagName || "").toLowerCase();
+            
+                if (
+                    tag === "input" ||
+                    tag === "textarea" ||
+                    tag === "select"
+                ) {
+                    return String(el.value ?? "").slice(0, 500);
+                }
+            
+                if (el.isContentEditable) {
+                    return String(el.textContent ?? "").slice(0, 500);
+                }
+            
+                return "";
+            };
+            
+            const absoluteXPath = (el) => {
+                if (!el || el.nodeType !== 1) return "";
+            
+                if (el.id) {
+                    return `//*[@id="${String(el.id).replace(/"/g, '\\"')}"]`;
+                }
+            
+                const parts = [];
+            
+                let current = el;
+            
+                while (current && current.nodeType === 1) {
+                    let index = 1;
+                    let sibling = current.previousElementSibling;
+            
+                    while (sibling) {
+                        if (sibling.tagName === current.tagName) {
+                            index += 1;
+                        }
+                        sibling = sibling.previousElementSibling;
+                    }
+            
+                    parts.unshift(
+                        `${current.tagName.toLowerCase()}[${index}]`
+                    );
+            
+                    current = current.parentElement;
+                }
+            
+                return "/" + parts.join("/");
+            };
+
+            const identity = (el) => ({
+                tag: (el.tagName || "").toLowerCase(),
+                id: el.id || "",
+                name: el.getAttribute("name") || "",
+                role: el.getAttribute("role") || "",
+                type: el.getAttribute("type") || "",
+                aria: el.getAttribute("aria-label") || "",
+                title: el.getAttribute("title") || "",
+                text: normalize(el.innerText || el.textContent || "", 160),
+                href: el.getAttribute("href") || "",
+                action: el.getAttribute("action") || "",
+                placeholder: el.getAttribute("placeholder") || "",
+                expanded: el.getAttribute("aria-expanded") || "",
+                checked: el.checked === true,
+                disabled: disabled(el)
+            });
+
+            const surfaces = [];
+            const controls = [];
+            const forms = [];
+            const links = [];
+
+            const actionableSelector = [
+                "button",
+                "a[href]",
+                "area[href]",
+                "[role='button']",
+                "[role='link']",
+                "[role='tab']",
+                "[role='menuitem']",
+                "[role='option']",
+                "[role='switch']",
+                "[role='checkbox']",
+                "[role='radio']",
+                "[aria-expanded]",
+                "[aria-haspopup]",
+                "[aria-controls]",
+                "[onclick]",
+                "[tabindex]:not([tabindex='-1'])"
+            ].join(",");
+
+            for (const el of document.querySelectorAll(actionableSelector)) {
+                if (!visible(el) || disabled(el)) continue;
+
+                const info = identity(el);
+                const tag = info.tag;
+                const type = info.type;
+
+                if (
+                    ["submit", "reset", "image"].includes(type)
+                ) {
+                    continue;
+                }
+
+                surfaces.push({
+                    action: "click",
+                    locator: absoluteXPath(el),
+                    identity: info,
+                    identity_hash_source: JSON.stringify(info),
+                    tag,
+                    type
+                });
+            }
+
+            // Frameworks sometimes render a real clickable control as a
+            // generic element. Discover it only when the live browser DOM
+            // exposes actual interaction semantics; never infer a URL/path.
+            for (const el of document.querySelectorAll("body *")) {
+                if (!visible(el) || disabled(el)) continue;
+                if (el.matches(actionableSelector)) continue;
+
+                const style = getComputedStyle(el);
+                const role = el.getAttribute("role") || "";
+                const tabindex = el.getAttribute("tabindex");
+                const hasHandler =
+                    typeof el.onclick === "function" ||
+                    el.hasAttribute("onclick");
+
+                if (
+                    style.cursor !== "pointer" &&
+                    !hasHandler &&
+                    !role &&
+                    tabindex === null
+                ) {
+                    continue;
+                }
+
+                const tag = (el.tagName || "").toLowerCase();
+
+                // Editable controls are observation-only.
+                if (
+                    ["input", "textarea", "select", "option"].includes(tag) ||
+                    el.isContentEditable
+                ) {
+                    continue;
+                }
+
+                const info = identity(el);
+
+                surfaces.push({
+                    action: "click",
+                    locator: absoluteXPath(el),
+                    identity: info,
+                    identity_hash_source: JSON.stringify(info),
+                    tag: info.tag,
+                    type: info.type
+                });
+            }
+
+            for (const el of document.querySelectorAll(
+                "input:not([type='hidden']), textarea, select, [contenteditable='true']"
+            )) {
+                if (!visible(el)) continue;
+
+                const info = identity(el);
+                controls.push({
+                    locator: absoluteXPath(el),
+                    identity: info,
+                    observed_only: true
+                });
+            }
+
+            for (const form of document.querySelectorAll("form")) {
+                if (!visible(form)) continue;
+
+                const info = identity(form);
+                forms.push({
+                    locator: absoluteXPath(form),
+                    identity: info,
+                    method: (
+                        form.getAttribute("method") || "GET"
+                    ).toUpperCase(),
+                    control_count: form.querySelectorAll(
+                        "input, textarea, select, button"
+                    ).length,
+                    observed_only: true
+                });
+            }
+
+            for (const el of document.querySelectorAll("a[href]")) {
+                if (!visible(el) || disabled(el)) continue;
+                const info = identity(el);
+                links.push({
+                    href: info.href,
+                    locator: absoluteXPath(el),
+                    identity: info
+                });
+            }
+
+            const dialogSelector = "dialog, [role='dialog']";
+
+            for (const el of document.querySelectorAll(dialogSelector)) {
+                if (!visible(el)) continue;
+            
+                const info = identity(el);
+            
+                /*
+                 * Dialogs are state/context observations.
+                 *
+                 * Do NOT enqueue the dialog container itself as an executable action.
+                 * Its real buttons/links are already discovered by the actionable
+                 * selector above.
+                 */
+            
+                controls.push({
+                    locator: absoluteXPath(el),
+                    identity: info,
+                    observed_only: true,
+                    surface_type: "dialog",
+                    container_observation: true
+                });
+            }
+
+            const scripts = [];
+            const resources = [];
+
+            for (const el of document.querySelectorAll("script")) {
+                const info = {
+                    src: el.getAttribute("src") || "",
+                    type: el.getAttribute("type") || "",
+                    async: el.async === true,
+                    defer: el.defer === true,
+                    module: (el.getAttribute("type") || "").toLowerCase() === "module",
+                    inline_length: (el.textContent || "").length,
+                };
+
+                scripts.push({
+                    locator: absoluteXPath(el),
+                    ...info,
+                    inline_observed: !info.src && !!el.textContent,
+                    observed_only: true
+                });
+            }
+
+            const resourceSelector = [
+                "link[href]",
+                "iframe[src]",
+                "object[data]",
+                "embed[src]"
+            ].join(",");
+
+            for (const el of document.querySelectorAll(resourceSelector)) {
+                const url =
+                    el.getAttribute("href") ||
+                    el.getAttribute("src") ||
+                    el.getAttribute("data") ||
+                    "";
+
+                if (!url) continue;
+
+                resources.push({
+                    tag: (el.tagName || "").toLowerCase(),
+                    url,
+                    locator: absoluteXPath(el),
+                    observed_only: true
+                });
+            }
+
+            const bodyText = normalize(
+                document.body ? document.body.innerText : "",
+                6000
+            );
+
+            const viewport = {
+                scroll_x: Math.round(window.scrollX || 0),
+                scroll_y: Math.round(window.scrollY || 0),
+                width: Math.round(window.innerWidth || 0),
+                height: Math.round(window.innerHeight || 0),
+                document_height: Math.round(Math.max(
+                    document.body ? document.body.scrollHeight : 0,
+                    document.documentElement ?
+                        document.documentElement.scrollHeight : 0
+                ))
+            };
+
+            const stateElements = [];
+            
+            for (const el of document.querySelectorAll(
+                "button, a[href], input, textarea, select, " +
+                "[role='button'], [role='tab'], [role='menuitem'], " +
+                "[aria-expanded], [aria-selected], [aria-checked], " +
+                "[aria-hidden], dialog"
+            )) {
+                if (!visible(el)) continue;
+            
+                const rect = el.getBoundingClientRect();
+            
+                stateElements.push({
+                    tag: (el.tagName || "").toLowerCase(),
+                    text: normalize(
+                        el.innerText ||
+                        el.textContent ||
+                        "",
+                        300
+                    ),
+                    aria: el.getAttribute("aria-label") || "",
+                    role: el.getAttribute("role") || "",
+                    name: el.getAttribute("name") || "",
+                    id: el.id || "",
+                    type: el.getAttribute("type") || "",
+                    href: el.getAttribute("href") || "",
+                    expanded: el.getAttribute("aria-expanded") || "",
+                    selected: el.getAttribute("aria-selected") || "",
+                    checked: el.getAttribute("aria-checked") || "",
+                    hidden: el.getAttribute("aria-hidden") || "",
+                    disabled: disabled(el),
+                    value: elementValue(el),
+                    visible: true,
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height)
+                });
+            }
+            
+            const visibleDialogs = [];
+            
+            for (const el of document.querySelectorAll(
+                "dialog, [role='dialog']"
+            )) {
+                if (!visible(el)) continue;
+            
+                visibleDialogs.push({
+                    text: normalize(
+                        el.innerText ||
+                        el.textContent ||
+                        "",
+                        1000
+                    ),
+                    aria: el.getAttribute("aria-label") || "",
+                    role: el.getAttribute("role") || ""
+                });
+            }
+            
+                        const stableStateElements = stateElements.map(x => ({
+                tag: x.tag,
+                text: x.text,
+                aria: x.aria,
+                role: x.role,
+                name: x.name,
+                id: x.id,
+                type: x.type,
+                href: x.href,
+                expanded: x.expanded,
+                selected: x.selected,
+                checked: x.checked,
+                hidden: x.hidden,
+                disabled: x.disabled
+            }));
+
+            const stableControls = controls.map(x => ({
+                identity: x.identity
+            }));
+
+            const stableForms = forms.map(x => ({
+                identity: x.identity,
+                method: x.method,
+                control_count: x.control_count
+            }));
+
+            const fingerprintSource = {
+                url: location.href || "",
+                title: document.title || "",
+
+                // Do NOT fingerprint the entire body text.
+                // Dynamic application data must not manufacture states.
+
+                // Meaningful interactive UI state only.
+                state_elements: stableStateElements,
+
+                // Dialog presence/content is meaningful state.
+                dialogs: visibleDialogs,
+
+                // Observed forms and controls.
+                controls: stableControls,
+                forms: stableForms
+            };
+
+            return {
+                url: location.href || "",
+                title: document.title || "",
+                body_text: bodyText,
+                viewport,
+                surfaces,
+                forms,
+                controls,
+                links,
+                scripts,
+                resources,
+                fingerprint_source: fingerprintSource
+            };
+        }
+        """
+
+        try:
+            snapshot = await page.evaluate(script)
+        except Exception as exc:
+            logger.debug("INTERACTION DOM observation failed: %s", exc)
+            return self._empty_snapshot()
+
+        if not isinstance(snapshot, dict):
+            return self._empty_snapshot()
+
+        source = snapshot.get("fingerprint_source", {})
+        state = self._hash(source)
+        snapshot["state"] = state
+
+        self.stats["dom_snapshot_ms"] += (
+            time.perf_counter() - started
+        ) * 1000
+
+        return snapshot
+
+    @staticmethod
+    def _empty_snapshot() -> dict[str, Any]:
+        return {
+            "url": "",
+            "title": "",
+            "body_text": "",
+            "surfaces": [],
+            "forms": [],
+            "controls": [],
+            "links": [],
+            "scripts": [],
+            "resources": [],
+            "fingerprint_source": {},
+            "state": "",
+        }
+
+    # ------------------------------------------------------------------
+    # Queue surfaces from a snapshot
+    # ------------------------------------------------------------------
+
+    async def _enqueue_snapshot_surfaces(
+        self,
+        page,
+        snapshot: dict[str, Any],
+    ) -> int:
+        state = self._safe_string(snapshot.get("state"))
+        added = 0
+
+        for item in self._as_list(snapshot.get("surfaces")):
+            if not isinstance(item, dict):
+                continue
+
+            action = self._safe_string(item.get("action")).lower()
+            locator = self._safe_string(item.get("locator"))
+            identity = item.get("identity") or {}
+
+            if not action or not locator:
+                continue
+
+            identity_hash = self._hash(identity)
+
+            surface = InteractionSurface(
+                priority=self._surface_priority(item),
+                action=action,
+                locator=locator,
+                source="rendered-dom",
+                metadata={
+                    "state": state,
+                    "identity": identity_hash,
+                    "identity_data": identity,
+                    "tag": item.get("tag", ""),
+                    "type": item.get("type", ""),
+                },
+            )
+
+            if await self.add_surface(surface):
+                added += 1
+
+        # Forms and editable controls are observations, not activation targets.
+        self._record_controls(snapshot)
+        self._record_forms(snapshot)
+        self._record_scripts(snapshot)
+        self._record_resources(snapshot)
+
+        for item in self._as_list(snapshot.get("forms")):
+            if isinstance(item, dict):
+                self._record_application_vector({
+                    "type": "form",
+                    "url": snapshot.get("url", ""),
+                    "method": item.get("method", "GET"),
+                    "evidence": [{
+                        "source": "rendered-dom",
+                        "locator": item.get("locator", ""),
+                        "identity": item.get("identity") or {},
+                    }],
+                })
+
+        for item in self._as_list(snapshot.get("controls")):
+            if isinstance(item, dict):
+                identity = item.get("identity") or {}
+                self._record_application_vector({
+                    "type": "input-control",
+                    "url": snapshot.get("url", ""),
+                    "parameter": identity.get("name", ""),
+                    "method": "DOM",
+                    "evidence": [{
+                        "source": "rendered-dom",
+                        "locator": item.get("locator", ""),
+                        "identity": identity,
+                    }],
+                })
+
+        for item in self._as_list(snapshot.get("links")):
+            if isinstance(item, dict):
+                href = self._safe_string(item.get("href"))
+                if href:
+                    self._record_application_vector({
+                        "type": "observed-link",
+                        "url": snapshot.get("url", ""),
+                        "target": href,
+                        "evidence": [{
+                            "source": "rendered-dom",
+                            "locator": item.get("locator", ""),
+                            "identity": item.get("identity") or {},
+                        }],
+                    })
+
+        return added
+
+    def _surface_priority(
+        self,
+        surface: InteractionSurface | dict[str, Any],
+    ) -> int:
+        """
+        Return the priority for an already-observed interaction surface.
+    
+        The dedicated BehavioralSurfaceSelector owns the behavioral scoring.
+        InteractionEngine only adapts its InteractionSurface representation
+        to the selector's input contract.
+        """
+    
+        if surface is None:
+            return 0
+    
+        if isinstance(surface, dict):
+            metadata = surface.get("metadata", surface)
+        else:
+            metadata = getattr(
+                surface,
+                "metadata",
+                {},
+            )
+    
+        if not isinstance(metadata, dict):
+            metadata = {}
+    
+        identity = metadata.get(
+            "identity",
+            metadata,
+        )
+    
+        if not isinstance(identity, dict):
+            identity = {}
+    
+        return int(
+            self.surface_selector.score(
+                {
+                    "identity": identity,
+                }
+            )
+        )
+    
+    def _record_controls(self, snapshot: dict[str, Any]) -> None:
+        for item in self._as_list(snapshot.get("controls")):
+            if not isinstance(item, dict):
+                continue
+
+            identity = item.get("identity") or {}
+            record = {
+                "locator": item.get("locator", ""),
+                "identity": identity,
+                "url": snapshot.get("url", ""),
+                "observed_only": True,
+            }
+
+            key = self._hash(record)
+            if not any(self._hash(x) == key for x in self._result["controls"]):
+                self._result["controls"].append(record)
+                self.stats["new_controls"] += 1
+
+            self.stats["controls_observed"] += 1
+
+    def _record_forms(self, snapshot: dict[str, Any]) -> None:
+        for item in self._as_list(snapshot.get("forms")):
+            if not isinstance(item, dict):
+                continue
+
+            record = {
+                "locator": item.get("locator", ""),
+                "identity": item.get("identity") or {},
+                "method": item.get("method", "GET"),
+                "control_count": item.get("control_count", 0),
+                "url": snapshot.get("url", ""),
+                "observed_only": True,
+            }
+
+            key = self._hash(record)
+            if not any(self._hash(x) == key for x in self._result["forms"]):
+                self._result["forms"].append(record)
+                self.stats["new_forms"] += 1
+
+            self.stats["forms"] += 1
+
+    def _record_scripts(self, snapshot: dict[str, Any]) -> None:
+        for item in self._as_list(snapshot.get("scripts")):
+            if not isinstance(item, dict):
+                continue
+
+            record = {
+                "url": snapshot.get("url", ""),
+                "locator": item.get("locator", ""),
+                "src": item.get("src", ""),
+                "type": item.get("type", ""),
+                "module": bool(item.get("module")),
+                "inline_observed": bool(item.get("inline_observed")),
+                "inline_length": int(item.get("inline_length", 0) or 0),
+                "observed_only": True,
+            }
+
+            key = self._hash(record)
+            if not any(self._hash(x) == key for x in self._result["scripts"]):
+                self._result["scripts"].append(record)
+                self.stats["scripts_observed"] += 1
+
+    def _record_resources(self, snapshot: dict[str, Any]) -> None:
+        for item in self._as_list(snapshot.get("resources")):
+            if not isinstance(item, dict):
+                continue
+
+            url = self._safe_string(item.get("url"))
+            if not url:
+                continue
+
+            record = {
+                "url": snapshot.get("url", ""),
+                "resource_url": url,
+                "tag": item.get("tag", ""),
+                "locator": item.get("locator", ""),
+                "observed_only": True,
+            }
+
+            key = self._hash(record)
+            if not any(self._hash(x) == key for x in self._result["observed_resources"]):
+                self._result["observed_resources"].append(record)
+                self.stats["resources_observed"] += 1
+
+    def _record_application_vector(self, vector: dict[str, Any]) -> None:
+        if not isinstance(vector, dict):
+            return
+
+        evidence = vector.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            return
+
+        key = self._hash(vector)
+        if any(self._hash(x) == key for x in self._result["application_vectors"]):
+            return
+
+        self._result["application_vectors"].append(vector)
+        self.stats["application_vectors"] += 1
+
+    # ------------------------------------------------------------------
+    # Runtime observation
+    # ------------------------------------------------------------------
+
+    async def _read_runtime_export(self, page) -> dict[str, Any]:
+        if page is None:
+            return {}
+
+        try:
+            if page.is_closed():
+                return {}
+        except Exception:
+            return {}
+
+        try:
+            value = await page.evaluate(
+                """
+                () => (
+                    window.__AVAF__ &&
+                    typeof window.__AVAF__.export === "function"
+                )
+                    ? window.__AVAF__.export()
+                    : {}
+                """
+            )
+        except Exception:
+            return {}
+
+        return value if isinstance(value, dict) else {}
+
+    def _record_runtime(self, runtime: Any) -> None:
+        if not isinstance(runtime, dict):
+            return
+
+        events = self._as_list(runtime.get("events"))
+
+        for event in events:
+            fingerprint = self._hash(event)
+
+            if fingerprint in self._runtime_fingerprints:
+                continue
+            
+            self._runtime_fingerprints.add(fingerprint)
+            
+            recorded_event = (
+                dict(event)
+                if isinstance(event, dict)
+                else {
+                    "value": event,
+                }
+            )
+            
+            recorded_event.setdefault(
+                "observation_phase",
+                "interaction-runtime",
+            )
+            
+            recorded_event.setdefault(
+                "browser_state",
+                self._current_state,
+            )
+            
+            self._result["events"].append(
+                recorded_event
+            )
+            
+            self._result["runtime_observations"].append(
+                recorded_event
+            )
+            
+            if isinstance(event, dict):
+                event.setdefault(
+                    "observation_phase",
+                    "interaction-runtime",
+                )
+
+                event.setdefault(
+                    "browser_state",
+                    self._current_state,
+                )
+                
+            self.stats["runtime_events"] += 1
+
+            category = ""
+            target = ""
+
+            if isinstance(event, dict):
+                category = self._safe_string(
+                    event.get("category") or event.get("type")
+                ).lower()
+                target = self._safe_string(
+                    event.get("target") or event.get("url")
+                )
+
+            if category == "network" and target:
+                metadata = (
+                    event.get("metadata", {})
+                    if isinstance(event, dict)
+                    else {}
+                )
+                method = self._safe_string(
+                    metadata.get("method") if isinstance(
+                        metadata, dict) else ""
+                ).upper() or "GET"
+
+                network_key = self._hash({
+                    "type": event.get("subtype", "network")
+                    if isinstance(event, dict) else "network",
+                    "method": method,
+                    "url": target,
+                    "status": metadata.get("status")
+                    if isinstance(metadata, dict) else None,
+                })
+
+                if network_key not in self._network_fingerprints:
+                    self._network_fingerprints.add(network_key)
+                    self._result["network_observations"].append({
+                        "type": event.get("subtype", "network")
+                        if isinstance(event, dict) else "network",
+                        "method": method,
+                        "url": target,
+                        "status": metadata.get("status")
+                        if isinstance(metadata, dict) else None,
+                        "metadata": metadata,
+                    })
+                    self.stats["network_observations"] += 1
+
+            if category == "navigation" and target:
+                self._record_navigation(target)
+
+    def _record_navigation(self, url: str) -> bool:
+        value = self._safe_string(url)
+
+        if not value or self._invalid_url(value):
+            return False
+
+        if value in self._observed_urls:
+            return False
+
+        self._observed_urls.add(value)
+
+        # ---------------------------------------------------------
+        # Every browser-observed navigation is retained as evidence.
+        # ---------------------------------------------------------
+
+        self._result["navigations"].append(value)
+
+        # ---------------------------------------------------------
+        # Only same-origin navigation is an application route.
+        #
+        # External navigation remains evidence but must never
+        # become an application crawl target.
+        # ---------------------------------------------------------
+
+        if self._same_interaction_origin(value):
+            self._result["routes"].append(value)
+            self.stats["new_routes"] += 1
+
+        else:
+            self._result.setdefault(
+                "external_navigations",
+                [],
+            ).append(value)
+
+        return True
+    
+    # ------------------------------------------------------------------
+    # Surface validation / safe execution
+    # ------------------------------------------------------------------
+
+    async def _surface_is_current(
+        self,
+        page,
+        surface: InteractionSurface,
+    ) -> bool:
+        if page is None or surface is None:
+            return False
+
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            return False
+
+        locator_text = self._safe_string(surface.locator)
+        if not locator_text:
+            return False
+
+        try:
+            locator = page.locator(f"xpath={locator_text}").first
+            if await locator.count() != 1:
+                return False
+            if not await locator.is_visible():
+                return False
+            if not await locator.is_enabled():
+                return False
+
+            box = await locator.bounding_box()
+            if not box or box["width"] <= 0 or box["height"] <= 0:
+                return False
+
+            return not await self._is_obscured(locator)
+        except Exception:
+            return False
+
+    async def _is_obscured(self, locator) -> bool:
+        try:
+            return bool(
+                await locator.evaluate(
+                    """
+                    element => {
+                        const rect = element.getBoundingClientRect();
+                        if (
+                            rect.width <= 0 ||
+                            rect.height <= 0
+                        ) return true;
+
+                        const x = rect.left + rect.width / 2;
+                        const y = rect.top + rect.height / 2;
+                        const top = document.elementFromPoint(x, y);
+
+                        return !(
+                            top === element ||
+                            (top && element.contains(top))
+                        );
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return True
+
+    async def _safe_click_target(self, locator) -> bool:
+        try:
+            info = await locator.evaluate(
+                """
+                e => ({
+                    tag: (e.tagName || "").toLowerCase(),
+                    type: e.getAttribute("type") || "",
+                    text: (
+                        e.innerText ||
+                        e.textContent ||
+                        ""
+                    ).trim().slice(0, 300),
+                    aria: e.getAttribute("aria-label") || "",
+                    name: e.getAttribute("name") || "",
+                    id: e.id || "",
+                    role: e.getAttribute("role") || "",
+                    href: e.getAttribute("href") || "",
+                    download: e.hasAttribute("download")
+                })
+                """
+            )
+        except Exception:
+            return False
+
+        tag = self._safe_string(info.get("tag")).lower()
+        input_type = self._safe_string(info.get("type")).lower()
+        href = self._safe_string(info.get("href"))
+
+        if input_type in {"submit", "reset", "image"}:
+            return False
+
+        if tag in {"a", "area"}:
+            if not href or info.get("download"):
+                return False
+
+            if href.startswith(
+                (
+                    "javascript:",
+                    "mailto:",
+                    "tel:",
+                    "sms:",
+                    "data:",
+                    "blob:",
+                )
+            ):
+                return False
+            
+            # A fragment-only href is allowed only when it represents
+            # an actual browser-observed same-origin navigation target.
+            #
+            # "#" by itself is only an in-page anchor and is not a page target.
+            if href.strip() == "#":
+                return False
+
+            try:
+                current = self._page_url(locator.page)
+                from urllib.parse import urljoin
+                resolved = urljoin(current, href)
+            except Exception:
+                return False
+
+            if not self._same_origin(locator.page, resolved):
+                return False
+
+        semantic = " ".join(
+            self._safe_string(info.get(key)).lower()
+            for key in ("text", "aria", "name", "id", "role")
+        )
+
+        blocked = (
+            "delete",
+            "remove",
+            "destroy",
+            "purchase",
+            "buy now",
+            "checkout",
+            "pay now",
+            "payment",
+            "transfer",
+            "send money",
+            "place order",
+            "confirm order",
+            "unsubscribe",
+            "cancel subscription",
+        )
+
+        return not any(token in semantic for token in blocked)
+
+    async def _execute_surface(
+        self,
+        page,
+        surface: InteractionSurface,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+
+        if page is None or surface is None:
+            return {"success": False, "reason": "invalid-surface"}
+
+        action = self._safe_string(surface.action).lower()
+
+        if action == "dialog":
+            self.stats["dialogs"] += 1
+            return {
+                "success": True,
+                "action": "observe-dialog",
+                "observed_only": True,
+            }
+
+        if action != "click":
+            return {
+                "success": False,
+                "reason": f"unsupported-action:{action}",
+            }
+
+        try:
+            locator = page.locator(
+                f"xpath={self._safe_string(surface.locator)}"
+            ).first
+
+            if await locator.count() != 1:
+                return {"success": False, "reason": "detached"}
+
+            if not await locator.is_visible():
+                return {"success": False, "reason": "not-visible"}
+
+            if not await locator.is_enabled():
+                return {"success": False, "reason": "disabled"}
+
+            box = await locator.bounding_box()
+            if not box or box["width"] <= 0 or box["height"] <= 0:
+                return {"success": False, "reason": "zero-size"}
+
+            if await self._is_obscured(locator):
+                return {"success": False, "reason": "obscured"}
+
+            if not await self._safe_click_target(locator):
+                return {"success": False, "reason": "unsafe-target"}
+
+            await locator.scroll_into_view_if_needed(timeout=1000)
+
+            if await self._is_obscured(locator):
+                return {"success": False, "reason": "obscured-after-scroll"}
+
+            # Normal Playwright click only. No force click and no synthetic
+            # dispatch fallback that could bypass a real browser obstruction.
+            await locator.click(
+                timeout=self.action_timeout,
+                no_wait_after=True,
+            )
+
+            self.stats["clicks"] += 1
+
+            return {
+                "success": True,
+                "action": "click",
+            }
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "reason": "click-failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        finally:
+            self.stats["action_ms"] += (
+                time.perf_counter() - started
+            ) * 1000
+
+    # ------------------------------------------------------------------
+    # State recording
+    # ------------------------------------------------------------------
+
+    def _record_state(
+        self,
+        snapshot: dict[str, Any],
+        state: str | None = None,
+        caused_by: dict[str, Any] | None = None,
+    ) -> bool:
+        """
+        Register one browser-observed application state.
+    
+        The BrowserObservationLedger is authoritative for state identity.
+        The optional `state` argument is retained for compatibility with
+        existing callers, but is not trusted as the state fingerprint.
+        """
+    
+        if not isinstance(snapshot, dict):
+            return False
+    
+        ledger_state, is_new = (
+            self.observation_ledger.record_state(
+                snapshot,
+                caused_by=caused_by,
+            )
+        )
+    
+        if not ledger_state:
+            return False
+    
+        # Ledger-generated fingerprint is authoritative.
+        observed_state = ledger_state
+    
+        self._current_state = observed_state
+    
+        self.stats["dom_states"] += 1
+    
+        self._result["dom_states"].append(
+            {
+                "state": observed_state,
+                "url": snapshot.get("url", ""),
+                "title": snapshot.get("title", ""),
+                "new": is_new,
+                **(
+                    {"caused_by": caused_by}
+                    if caused_by
+                    else {}
+                ),
+            }
+        )
+    
+        if is_new:
+            self._visited_states.add(observed_state)
+    
+            self.stats["new_dom_states"] += 1
+    
+            self._graph[observed_state] = {
+                "url": snapshot.get(
+                    "url",
+                    "",
+                ),
+                "title": snapshot.get(
+                    "title",
+                    "",
+                ),
+            }
+    
+        return is_new
+    
+    # ------------------------------------------------------------------
+    # Browser viewport exploration
+    # ------------------------------------------------------------------
+
+    async def _explore_next_viewport(
+        self,
+        page,
+        seen_positions: set[int],
+    ) -> dict[str, Any] | None:
+        """
+        Move through the actual rendered document using the browser's
+        observed viewport/document dimensions.
+
+        This is not a page crawler and does not generate targets. It exists
+        so lazy-rendered controls/content that are not present in the initial
+        viewport can become observable through normal browser behavior.
+        """
+
+        try:
+            if page.is_closed():
+                return None
+        except Exception:
+            return None
+
+        try:
+            metrics = await page.evaluate(
+                """
+                () => ({
+                    y: Math.round(window.scrollY || 0),
+                    viewport: Math.round(window.innerHeight || 0),
+                    height: Math.round(Math.max(
+                        document.body ? document.body.scrollHeight : 0,
+                        document.documentElement ?
+                            document.documentElement.scrollHeight : 0
+                    ))
+                })
+                """
+            )
+        except Exception:
+            return None
+
+        if not isinstance(metrics, dict):
+            return None
+
+        y = int(metrics.get("y", 0) or 0)
+        viewport = int(metrics.get("viewport", 0) or 0)
+        height = int(metrics.get("height", 0) or 0)
+
+        if viewport <= 0 or height <= viewport:
+            return None
+
+        # The next position is derived solely from the observed viewport.
+        # It is not a fixed application page/path and does not create URLs.
+        step = max(200, int(viewport * 0.80))
+        next_y = min(height - viewport, y + step)
+
+        if next_y <= y or next_y in seen_positions:
+            return None
+
+        seen_positions.add(next_y)
+
+        try:
+            await page.evaluate(
+                "(y) => window.scrollTo({top: y, behavior: 'auto'})",
+                next_y,
+            )
+            await page.wait_for_timeout(250)
+        except Exception:
+            return None
+
+        snapshot = await self.discover_live_dom_surfaces(page)
+        state = self._safe_string(snapshot.get("state"))
+
+        if not state:
+            return None
+
+        self._current_state = state
+        self._record_state(
+            snapshot,
+            state,
+            caused_by={
+                "type": "browser-viewport-scroll",
+                "scroll_y": next_y,
+            },
+        )
+
+        await self._enqueue_snapshot_surfaces(
+            page,
+            snapshot,
+        )
+        
+        
+
+        await self._capture_new_state_screenshot(
+            page=page,
+            snapshot=snapshot,
+            state=state,
+            caused_by={
+                "type": "browser-viewport-scroll",
+                "scroll_y": next_y,
+            },
+        )
+
+        runtime = await self._read_runtime_export(page)
+        self._record_runtime(runtime)
+
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # Main exploration
+    # ------------------------------------------------------------------
+
+    async def explore(
+        self,
+        page,
+        decision_engine=None,
+    ) -> dict[str, Any]:
+        """
+        Explore one already-open browser page.
+
+        The stop condition is an observed stable state with no unconsumed
+        surfaces. There is no arbitrary max-actions/max-rounds discovery cap.
+        """
+
+        started = time.perf_counter()
+        self.reset()
+        
+        self.decision_engine = decision_engine
+
+        if page is None:
+            return self.get_result()
+
+        try:
+            if page.is_closed():
+                return self.get_result()
+        except Exception:
+            return self.get_result()
+
+        initial_url = self._page_url(page)
+        parsed_initial = urlparse(
+            initial_url
+        )
+        
+        self._interaction_origin = (
+            parsed_initial.scheme.lower(),
+            (parsed_initial.hostname or "").lower(),
+            parsed_initial.port,
+        )
+        if self._invalid_url(initial_url):
+            return self.get_result()
+
+        self._log(
+            "info",
+            f"STATE-DRIVEN INTERACTION ENGINE loaded | url={initial_url}",
+        )
+
+        # Initial observation is authoritative. If it fails, do not claim
+        # zero surfaces or natural convergence.
+        snapshot = await self.discover_live_dom_surfaces(page)
+        state = self._safe_string(snapshot.get("state"))
+
+        if not state:
+            self._result["stats"] = dict(self.stats)
+            self._log(
+                "warning",
+                "Rendered DOM observation failed; interaction stopped without declaring convergence.",
+            )
+            return self.get_result()
+
+        self._current_state = state
+        self._record_state(snapshot, state)
+        
+        await self._capture_new_state_screenshot(
+            page=page,
+            snapshot=snapshot,
+            state=state,
+            caused_by={
+                "type": "initial-observation",
+            },
+        )
+        
+        await self._enqueue_snapshot_surfaces(
+            page,
+            snapshot,
+        )
+
+        self._log(
+            "info",
+            (
+                f"STATE 001 | NEW | "
+                f"url={snapshot.get('url', initial_url)} | "
+                f"surfaces={len(snapshot.get('surfaces', []))} | "
+                f"controls={len(snapshot.get('controls', []))} | "
+                f"forms={len(snapshot.get('forms', []))}"
+            ),
+        )
+
+        previous_url = snapshot.get("url", initial_url)
+
+        # Positions are learned from the actual rendered document. This set
+        # is only a browser-observation guard against revisiting the same
+        # viewport position forever.
+        seen_viewport_positions: set[int] = set()
+
+        try:
+            initial_y = int(
+                snapshot.get("viewport", {}).get("scroll_y", 0) or 0
+            )
+            seen_viewport_positions.add(initial_y)
+        except Exception:
+            seen_viewport_positions.add(0)
+
+        while True:
+            self.stats["rounds"] += 1
+
+            try:
+                if page.is_closed():
+                    break
+            except Exception:
+                break
+
+            # Always re-observe before consuming queued work. This prevents
+            # stale overlays/mutated elements from being treated as current.
+            before = await self.discover_live_dom_surfaces(page)
+            before_state = self._safe_string(before.get("state"))
+
+            if not before_state:
+                self._log(
+                    "warning",
+                    "Current DOM observation failed; queued surfaces were not executed.",
+                )
+                break
+
+            self._current_state = before_state
+            self._record_state(before, before_state)
+
+            await self._enqueue_snapshot_surfaces(page, before)
+
+            # Runtime is evidence, not a source of guessed surfaces/URLs.
+            runtime = await self._read_runtime_export(page)
+            self._record_runtime(runtime)
+
+            surface = await self.next_surface()
+
+            if surface is None:
+                # Before convergence, inspect the next real browser viewport.
+                # Lazy-rendered application controls can appear only after
+                # scrolling. If new surfaces appear, the normal interaction
+                # loop continues from that observed state.
+                viewport_snapshot = await self._explore_next_viewport(
+                    page,
+                    seen_viewport_positions,
+                )
+
+                if viewport_snapshot is not None:
+                    if self.has_work():
+                        continue
+
+                    # The viewport changed but exposed no actionable surface.
+                    # Continue discovering the next observed viewport rather
+                    # than treating one empty viewport as global convergence.
+                    continue
+
+                # Only after the actual rendered document has no further
+                # viewport positions and no queued safe surfaces do we stop.
+                break
+
+            surface_state = self._safe_string(
+                (surface.metadata or {}).get("state")
+            )
+
+            if surface_state and surface_state != before_state:
+                self.stats["skipped_actions"] += 1
+                surface.visited = True
+                continue
+
+            if not await self._surface_is_current(page, surface):
+                self.stats["skipped_actions"] += 1
+                surface.visited = True
+                continue
+
+            key = self._surface_key(surface)
+            if key in self._executed:
+                surface.visited = True
+                continue
+
+            self._log(
+                "info",
+                (
+                    f"ACTION {self.stats['actions'] + 1:03d} | "
+                    f"{surface.action} | "
+                    f"{surface.metadata.get('tag', '')} | "
+                    f"url={self._page_url(page)}"
+                ),
+            )
+
+            result = await self._execute_surface(page, surface)
+            self.mark_executed(surface)
+
+            if not result.get("success"):
+                self.stats["failed_actions"] += 1
+
+            await self._settle_after_action(page, previous_url)
+
+            
+            
+            
+            
+            
+            after = await self.discover_live_dom_surfaces(page)
+            after_state = self._safe_string(
+                after.get("state")
+            )
+
+            after_url = self._safe_string(
+                after.get("url")
+            )
+
+            # -------------------------------------------------------------
+            # External navigation recovery
+            #
+            # A real browser action can leave the application origin.
+            #
+            # External destinations are evidence only:
+            # they are never promoted to crawl targets.
+            #
+            # The browser execution context can disappear while navigation
+            # is occurring. Therefore a failed DOM observation immediately
+            # after an action is NOT itself convergence.
+            #
+            # If the browser left the application origin:
+            #
+            #   1. record the external navigation;
+            #   2. restore the previously observed application URL;
+            #   3. re-observe the browser;
+            #   4. continue consuming the remaining interaction queue.
+            # -------------------------------------------------------------
+
+            external_navigation_recovered = False
+
+            if not after_state:
+
+                current_browser_url = self._page_url(page)
+
+                if (
+                    current_browser_url
+                    and self._same_interaction_origin(
+                        current_browser_url
+                    )
+                ):
+                    # The browser remained on the application origin.
+                    # The first evaluation may have lost its execution
+                    # context transiently, so retry the observation once.
+                    after = await self.discover_live_dom_surfaces(
+                        page
+                    )
+
+                    after_state = self._safe_string(
+                        after.get("state")
+                    )
+
+                    after_url = self._safe_string(
+                        after.get("url")
+                    )
+
+                if not after_state:
+
+                    external_url = (
+                        current_browser_url
+                        or after_url
+                    )
+
+                    if (
+                        external_url
+                        and not self._same_interaction_origin(
+                            external_url
+                        )
+                    ):
+                        self._result[
+                            "external_navigation"
+                        ] = True
+
+                        self._result[
+                            "external_url"
+                        ] = external_url
+
+                        self._result[
+                            "events"
+                        ].append({
+                            "type": "external-navigation",
+                            "url": external_url,
+                            "source_url": previous_url,
+                            "state": before_state,
+                        })
+
+                        if self.runtime_callback is not None:
+                            try:
+                                feedback = self.runtime_callback({
+                                    "type": "external-navigation",
+                                    "url": external_url,
+                                    "source_url": previous_url,
+                                })
+
+                                if hasattr(
+                                    feedback,
+                                    "__await__",
+                                ):
+                                    await feedback
+
+                            except Exception:
+                                pass
+
+                        restored = (
+                            await self._restore_application_state(
+                                page,
+                                previous_url,
+                            )
+                        )
+
+                        if not restored:
+                            self._log(
+                                "warning",
+                                "External navigation observed but "
+                                "application state could not be restored; "
+                                "stopping interaction branch.",
+                            )
+                            break
+
+                        external_navigation_recovered = True
+
+                        # -------------------------------------------------
+                        # Re-observe the restored browser state.
+                        # -------------------------------------------------
+
+                        after = (
+                            await self.discover_live_dom_surfaces(
+                                page
+                            )
+                        )
+
+                        after_state = self._safe_string(
+                            after.get("state")
+                        )
+
+                        after_url = self._safe_string(
+                            after.get("url")
+                        )
+
+                        if not after_state:
+                            self._log(
+                                "warning",
+                                "Application state restored but rendered "
+                                "DOM observation failed; stopping "
+                                "interaction branch.",
+                            )
+                            break
+
+                        after[
+                            "restored_after_external_navigation"
+                        ] = True
+                        
+                        # The restored browser state is a fresh observation.
+                        # Register its currently visible actionable surfaces again.
+                        # Nothing is invented: all surfaces come directly from
+                        # the restored rendered browser state.
+                        
+                        self._current_state = after_state
+
+                        self._record_state(
+                            after,
+                            after_state,
+                            caused_by={
+                                "type": "external-navigation-recovery",
+                                "external_url": external_url,
+                            },
+                        )
+                        
+                        # The DOM that existed before the external navigation was destroyed.
+                        # Any pending Playwright locators/surface identities belong to that
+                        # previous browser state and must not be reused.
+                        self._interaction_queue.clear()
+                        self._seen_surfaces.clear()
+                        self._executed.clear()
+                        
+                        # Rebuild interaction work exclusively from the newly rendered
+                        # browser-observed state.
+                        await self._enqueue_snapshot_surfaces(
+                            page,
+                            after,
+                        )
+                        
+                        # The previous browser DOM no longer exists.
+                        # Never execute surfaces captured from that destroyed DOM.
+                        self._interaction_queue.clear()
+                        self._seen_surfaces.clear()
+                        self._executed.clear()
+                        
+                        # Rebuild only from the freshly rendered browser state.
+                        await self._enqueue_snapshot_surfaces(
+                            page,
+                            after,
+                        )
+                        
+                        runtime_after_restore = (
+                            await self._read_runtime_export(page)
+                        )
+                        
+                        self._record_runtime(
+                            runtime_after_restore
+                        )
+
+                        self._log(
+                            "info",
+                            "Application state restored after external "
+                            "navigation; continuing behavioral exploration."
+                        )
+
+                    else:
+                        self._log(
+                            "warning",
+                            "Post-action DOM observation failed without "
+                            "confirmed external navigation; stopping "
+                            "without declaring convergence.",
+                        )
+                        break
+
+            # -------------------------------------------------------------
+            # If the action produced a normal same-origin navigation,
+            # retain it as browser-observed navigation evidence.
+            #
+            # If an external navigation was already recovered above,
+            # NEVER execute another external-navigation termination path.
+            # -------------------------------------------------------------
+
+            url_changed = bool(
+                after_url
+                and after_url != previous_url
+            )
+
+            if (
+                after_url
+                and not self._same_interaction_origin(after_url)
+                and not external_navigation_recovered
+            ):
+                self._record_navigation(
+                    after_url
+                )
+
+                self._result[
+                    "external_navigation"
+                ] = True
+
+                self._result[
+                    "external_url"
+                ] = after_url
+
+                self._result[
+                    "events"
+                ].append({
+                    "type": "external-navigation",
+                    "url": after_url,
+                    "source_url": previous_url,
+                    "state": before_state,
+                })
+
+                self._log(
+                    "info",
+                    "External navigation observed; recording "
+                    "evidence without crawling the external origin."
+                )
+
+                # Do not treat an external destination as an application
+                # state. The recovery path above is responsible for
+                # restoring the previous browser-observed application state.
+                break
+            
+            state_changed = after_state != before_state
+
+            if url_changed:
+                self.stats["navigation_changes"] += 1
+                self._record_navigation(after_url)
+
+            caused_by = {
+                "type": "interaction",
+                "action": surface.action,
+                "surface": surface.metadata.get("identity"),
+            }
+            
+            is_new_state = self._record_state(
+                after,
+                after_state,
+                caused_by=caused_by,
+            )
+            
+            self._current_state = after_state
+            
+            if is_new_state:
+                await self._capture_new_state_screenshot(
+                    page=page,
+                    snapshot=after,
+                    state=after_state,
+                    caused_by=caused_by,
+                )
+            
+            previous_url = after_url or previous_url
+
+            # Runtime after the action is captured before the next decision.
+            runtime = await self._read_runtime_export(page)
+            self._record_runtime(runtime)
+
+            await self._enqueue_snapshot_surfaces(page, after)
+
+            self._log(
+                "info",
+                (
+                    f"OBSERVE | "
+                    f"url_changed={url_changed} | "
+                    f"dom_changed={state_changed} | "
+                    f"new_state={is_new_state} | "
+                    f"queued={len(self._interaction_queue)}"
+                ),
+            )
+
+            # A state that was already observed may still expose a surface
+            # that was not consumed in that state. Therefore do not terminate
+            # merely because the state fingerprint is unchanged.
+            if (
+                not self.has_work()
+                and not state_changed
+                and not url_changed
+            ):
+                break
+
+        await self._final_observation(page)
+
+        self.stats["total_ms"] = (
+            time.perf_counter() - started
+        ) * 1000
+
+        self._result["stats"] = dict(self.stats)
+        self._result["browser_observed"] = {
+            "final_url": self._page_url(page),
+            "states": len(self._visited_states),
+            "screenshots": len(self._captured_state_screenshots),
+            "executed_actions": self.stats["actions"],
+            "observed_surfaces": self.stats["surfaces"],
+        }
+
+        self._log(
+            "info",
+            (
+                "Behavioral exploration complete | "
+                f"rounds={self.stats['rounds']} | "
+                f"actions={self.stats['actions']} | "
+                f"new_states={self.stats['new_dom_states']} | "
+                f"new_routes={self.stats['new_routes']}"
+            ),
+        )
+
+        return self.get_result()
+
+    async def _restore_application_state(
+        self,
+        page,
+        application_url: str,
+    ) -> bool:
+        """
+        Restore the last browser-observed application URL after an
+        external navigation.
+
+        The URL is not generated or guessed. It is the URL that was
+        already observed before the interaction.
+        """
+
+        target = self._safe_string(application_url)
+
+        if not target or self._invalid_url(target):
+            return False
+
+        if not self._same_interaction_origin(target):
+            return False
+
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            return False
+
+        try:
+            await page.goto(
+                target,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+
+            try:
+                await page.wait_for_load_state(
+                    "networkidle",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
+
+            restored = self._page_url(page)
+
+            if not restored:
+                return False
+
+            if not self._same_interaction_origin(restored):
+                return False
+
+            return True
+
+        except Exception:
+            return False
+
+    async def _settle_after_action(
+        self,
+        page,
+        before_url: str,
+    ) -> None:
+        started = time.perf_counter()
+
+        try:
+            await page.wait_for_timeout(
+                int(self.post_action_delay * 1000)
+            )
+        except Exception:
+            pass
+
+        try:
+            current = self._page_url(page)
+            if current and current != before_url:
+                await page.wait_for_timeout(150)
+        except Exception:
+            pass
+
+        self.stats["settle_ms"] += (
+            time.perf_counter() - started
+        ) * 1000
+
+    async def _final_observation(self, page) -> None:
+        if page is None:
+            return
+
+        try:
+            if page.is_closed():
+                return
+        except Exception:
+            return
+
+        snapshot = await self.discover_live_dom_surfaces(page)
+        state = self._safe_string(snapshot.get("state"))
+
+        if state:
+            self._record_state(snapshot, state)
+
+        runtime = await self._read_runtime_export(page)
+        self._record_runtime(runtime)
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _log(level: str, message: str) -> None:
+        """
+        Internal InteractionEngine diagnostics.
+    
+        Interaction actions such as click/state/DOM observation are backend
+        implementation details and must not be emitted to the discovery console.
+    
+        Meaningful discovery evidence is reported by the crawler/collector
+        layer instead.
+        """
+    
+        # InteractionEngine logging is intentionally silent at the user-facing
+        # discovery console level.
+        #
+        # Browser actions, DOM inspection, state comparison, settling and
+        # interaction bookkeeping continue to execute normally.
+        return
