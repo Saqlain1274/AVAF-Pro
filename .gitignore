@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
@@ -12,19 +12,36 @@ env/
 .vscode/
 .idea/
 
-# Runtime/generated output
-phase1_scanning_detection/output/
-phase1_scanning_detection/screenshots/
-
-# Logs
-*.log
-
 # OS
 .DS_Store
 Thumbs.db
 
-# Secrets
-.env
-*.env
+# Generated Phase 1 output
+phase1_scanning_detection/output/
+
+# Generated screenshots
+screenshots/
+phase1_scanning_detection/screenshots/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Test/cache files
+.pytest_cache/
+.mypy_cache/
+
+# Keep project source files
+!phase1_scanning_detection/**/*.py
+!phase2_refinement_validation/**/*.py
+!phase3_reporting/**/*.py
+
+# Node.js dependencies
+node_modules/
+
 # Node.js dependencies
 node_modules/
